@@ -1,0 +1,1153 @@
+---
+title: "CRWA Flagging Model - 2023 Update"
+author: "Ayushman Choudhury"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  html_document:
+    toc: true
+---
+
+# Introduction
+
+My name is Ayushman Choudhury. I'm currently a sophomore at Brown University studying Applied Mathematics, Computer Science, and Music. For my Winternship with the Charles River Watershed Association, I updated the E. Coli Flagging Model, used to generate recommendations regarding water quality on the Charles River.
+
+In this file, I have documented my process, including gathering data, wrangling it in R, and creating GLM and MLR models for each of CRWA's 4 locations along the Charles River.
+
+Boilerplate Text - this is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When code is executed within the notebook, the results appear beneath the code. Code can be executed by clicking the *Run* button within the chunk or by placing the cursor inside it and pressing *Cmd+Shift+Enter*.
+
+```{r Load Libraries, message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(dataRetrieval)
+library(caret)
+library(naniar)
+set.seed(1)
+```
+
+# Section 1: Gathering Data
+
+## 1.1 - E. Coli
+
+The first data source is a copy of CRWA's E. coli data from 2017 to 2022. These are the values that this model will predict. I did some basic selecting and Date/Time formatting in a Google Sheet, before loading the CSV in R. Here are the columns I used:
+
+-   Date_Collected - samples are weekly, typically on Thursdays
+-   Time_Collected - typically in the morning
+-   Site_ID - either 1NBS, 2LARZ, 3BU, or 4LONG
+-   Reporting_Result - E. coli. measured in cfu/100mL
+
+In the following code, I access this CSV from my local "sources" folder, combine Date and Time into `datetime`, and round it to the nearest 10-minute interval. The tibble and dot plot give a quick overview.
+
+```{r 1.1 - E. Coli}
+ecoliData <- read.csv("sources/ecoliWrangledCopy.csv") %>% 
+  mutate(datetime = round_date(
+    as.POSIXct(
+      paste(.$Date_Collected, .$Time_Collected), 
+      format = "%m/%d/%Y %H:%M:%S"), 
+    "10 minutes")) %>%
+  select(datetime, Site_ID, Reporting_Result) %>%
+  filter(.$Site_ID %in% c("1NBS", "2LARZ", "3BU", "4LONG"))
+
+ecoliData %>% tibble()
+
+ecoliData %>% ggplot(aes(x = datetime, y = Reporting_Result, color = Site_ID)) +
+  geom_point() +
+  scale_y_continuous(trans = 'log10') + 
+  ggtitle("E. Coli levels over time at 4 locations, logarithmic y scale") +
+  labs(x = "Date", y = "E. Coli level (cfu/100mL)")
+```
+
+------------------------------------------------------------------------
+
+## 1.2 - Weather
+
+The second data source is CRWA's weather data. This is stored in several CSV files by year, from 2017 to 2022, each of which has about 26,000 rows. Each file has a different amount of metadata to skip --- `read.csv()` has a skip parameter, but I just removed these rows manually in a text editor. The following code accesses them from my local "sources" folder.
+
+```{r 1.2 - Weather Data}
+rawWeather2017 <- read.csv("sources/2017_Flagging_Season_2023_01_09_09_55_56_EST_1.csv")
+rawWeather2018 <- read.csv("sources/2018_Flagging_Season_2023_01_09_09_54_55_EST_1.csv")
+rawWeather2019 <- read.csv("sources/2019_Flagging_Season_2023_01_09_09_53_45_EST_1.csv")
+rawWeather2020 <- read.csv("sources/2020_Flagging_Season_2023_01_09_09_44_11_EST_1.csv")
+rawWeather2021 <- read.csv("sources/2021_Flagging_Season_2023_01_09_09_48_29_EST_1.csv")
+rawWeather2022 <- read.csv("sources/2022_Flagging_Season_2023_01_09_09_50_04_EST_1.csv")
+```
+
+There's some wrangling to do here too:
+
+1.  Each file has its columns in a different order, so I standardized this order as Pressure, PAR, Rain, RH%, Wind Dir, Wind Speed, Gust Speed, DewPt, Air Temp, Water Temp. (Temperatures are in Fahrenheit).
+2.  For some data points, the values jump between several different columns. I merged these together.
+
+```{r 1.2 - Weather wrangling}
+#2017 -- 
+colnames(rawWeather2017) = c("id", "time", "pressure", "par", "rain", "rh", "gustSpeed", "dewPt", "windDir", "airTemp", "windSpeed", "waterTemp")
+
+weather2017 <- rawWeather2017 %>%
+  mutate(waterTemp = ifelse(waterTemp > 32, waterTemp, NA)) %>%
+  mutate(datetime = as.POSIXct(time, format = "%m/%d/%y %H:%M:%S")) %>%
+  select(datetime, pressure, par, rain, rh, windDir, windSpeed, gustSpeed, dewPt, airTemp, waterTemp)
+
+#2018 -- 
+colnames(rawWeather2018) = c("id", "time", "pressure", "par", "rain", "rh", "windSpeed", "gustSpeed", "dewPt", "windDir", "waterTemp2", "airTemp3", "airTemp2", "airTemp1", "waterTemp1", "waterTempNull")
+
+weather2018 <- rawWeather2018 %>%
+  mutate(waterTemp = ifelse(is.na(waterTemp2), waterTemp1, waterTemp2)) %>%
+  mutate(airTemp = ifelse(is.na(airTemp3), ifelse(is.na(airTemp2), airTemp1, airTemp2), airTemp3)) %>%
+  mutate(datetime = as.POSIXct(time, format = "%m/%d/%y %H:%M:%S")) %>%
+  select(datetime, pressure, par, rain, rh, windDir, windSpeed, gustSpeed, dewPt, airTemp, waterTemp)
+
+#2019 --
+colnames(rawWeather2019) = c("id", "time", "pressure", "par", "rain", "rh", "windSpeed", "gustSpeed", "dewPt", "windDir", "waterTemp", "airTemp")
+
+weather2019 <- rawWeather2019 %>%
+  mutate(datetime = as.POSIXct(time, format = "%m/%d/%y %H:%M:%S")) %>%
+  select(datetime, pressure, par, rain, rh, windDir, windSpeed, gustSpeed, dewPt, airTemp, waterTemp)
+
+#2020 --
+colnames(rawWeather2020) = c("id", "time", "pressure", "par", "rain", "rh", "windSpeed", "gustSpeed", "dewPt1", "windDir1", "airTemp1", "waterTemp1", "waterTemp2", "dewPt2", "windDir2", "airTemp2")
+
+weather2020 <- rawWeather2020 %>%
+  mutate(dewPt = ifelse(is.na(dewPt2), dewPt1, dewPt2)) %>%
+  mutate(windDir = ifelse(is.na(windDir2), windDir1, windDir2)) %>%
+  mutate(airTemp = ifelse(is.na(airTemp2), airTemp1, airTemp2)) %>%
+  mutate(waterTemp = NA) %>%
+  mutate(datetime = as.POSIXct(time, format = "%m/%d/%y %H:%M:%S")) %>%
+  select(datetime, pressure, par, rain, rh, windDir, windSpeed, gustSpeed, dewPt, airTemp, waterTemp)
+
+#2021 --
+colnames(rawWeather2021) = c("id", "time", "pressure", "par", "rain", "rh", "windSpeed", "gustSpeed", "dewPt1", "windDir1", "airTemp1", "waterTempNull", "dewPt2", "windDir2", "tempUnknown", "airTemp2")
+
+weather2021 <- rawWeather2021 %>%
+  mutate(dewPt = ifelse(is.na(dewPt2), dewPt1, dewPt2)) %>%
+  mutate(windDir = ifelse(is.na(windDir2), windDir1, windDir2)) %>%
+  mutate(airTemp = ifelse(is.na(airTemp2), airTemp1, airTemp2)) %>%
+  mutate(waterTemp = tempUnknown) %>%
+  mutate(datetime = as.POSIXct(time, format = "%m/%d/%y %H:%M:%S")) %>%
+  select(datetime, pressure, par, rain, rh, windDir, windSpeed, gustSpeed, dewPt, airTemp, waterTemp)
+
+#2022 --
+colnames(rawWeather2022) = c("id", "time", "pressure", "par", "rain", "rh", "dewPt", "windDir", "waterTemp", "airTemp", "windSpeed", "gustSpeed")
+
+weather2022 <- rawWeather2022 %>%
+  mutate(datetime = as.POSIXct(time, format = "%m/%d/%y %H:%M:%S")) %>%
+  select(datetime, pressure, par, rain, rh, windDir, windSpeed, gustSpeed, dewPt, airTemp, waterTemp)
+```
+
+We can stack all of these together to create a large (158,116 x 11) dataset for all of the weather data. Here's a quick tibble to show the results.
+
+```{r 1.2 - Weather rbind}
+weatherData <- rbind(weather2017, weather2018, weather2019, weather2020, weather2021, weather2022)
+
+weatherData %>% tibble()
+```
+
+------------------------------------------------------------------------
+
+## 1.3 - USGS Water Data - discharge
+
+The final data source is USGS's water data regarding discharge. USGS has a specific R library `dataRetrieval` which I use below. The location is in Waltham, MA on the Charles River (site number 01104500). Below, I access the discharge data (code 00060) from the beginning of 2017 to the end of 2022.
+
+```{r 1.3 - USGS fetch}
+waltham <- readNWISuv(siteNumbers = "01104500",
+                      parameterCd = "00060",
+                      startDate = "2017-01-01",
+                      endDate = "2022-12-31") %>% 
+  renameNWISColumns()
+```
+
+Retrieving this data from USGS can take some time, but once it is done we can include it as yet another predictor. Here's a quick plot of the flow during 2022.
+
+```{r 1.3 - USGS plot}
+waltham %>% 
+  filter(dateTime >= as.Date('2022-01-01'), dateTime <= as.Date('2022-12-31')) %>%
+  ggplot(aes(dateTime, Flow_Inst)) +
+  geom_line() +
+  ggtitle("Flow Discharge data from USGS in 2022")
+```
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+# Section 2: Defining Features and Outcomes
+
+## 2.1 - Strategy
+
+We have 627 E. Coli measurements. To predict these measurements, we should have 627 sets of features from which to train our model. The simplest choice would be to only use the 627 rows at the times the E. Coli sample was recorded. However, since E. Coli populations can depend on the conditions of the water over the previous hour or day (and since we have a lot more than 627 rows), we can also include averages of the flow and weather values over the previous 1 hour, 12 hours, 24 hours, 48 hours, and 72 hours.
+
+We can be even more specific with the rainfall values. CRWA has previously used these variables (credit to Eli Kane):
+
+-   12 hour intervals: 0-12, 12-24, 24-36, 36-48, 48-60, 60-72, 72-84, 84-96
+-   24 hour intervals: 0-24, 24-48, 48-72, 72-96
+-   48 hour intervals: 0-48, 48-96
+-   Prior week: 0-168
+-   Days since last rain & Days since last major rain (\> 0.1 inches)
+
+For averages, I will be using the geometric mean over the arithmetic mean, to lessen the effect of outliers. This can be calculated as `exp(mean(log(data)))`.
+
+------------------------------------------------------------------------
+
+## 2.2 - Flow Features
+
+For each E. coli measurement time, I:
+
+-   Calculate its index in the flow data frame
+-   Get the Geometric means of the flow 1/12/24/48/72 hours prior using `sapply`
+
+Once these values are stored, I transpose the matrix, cast it to a data frame, and adjust the column/row names.
+
+```{r 2.1 - Flow Features}
+
+flowFeaturesSeparate <- sapply(ecoliData$datetime, function(x) {
+  flowIndex <- length(which(waltham$dateTime <= x))
+  
+  flowTimes <- c(1,12,24,48,72) * 4 - 1
+  
+  sapply(flowTimes, function(x){
+    exp(mean(log(waltham$Flow_Inst[(flowIndex - x):flowIndex])))
+  })
+})
+
+flowFeatures <- flowFeaturesSeparate %>%
+  data.frame() %>% t() %>% data.frame()
+
+colnames(flowFeatures) = c("hourAvgFlow", "halfDayAvgFlow", "dayAvgFlow", "twoDayAvgFlow", "threeDayAvgFlow")
+
+row.names(flowFeatures) <- NULL
+```
+
+------------------------------------------------------------------------
+
+## 2.3 - Rainfall Total Features
+
+Here, I use multiple sapply calls for each range.
+
+```{r 2.2 - Rainfall Total Features}
+
+rainfallFeaturesSeparate <- sapply(ecoliData$datetime, function(x) {
+  weatherIndex = length(which(weatherData$datetime <= x))
+  
+  halfDayIntervals <- sapply(seq(12,96,12), function(t) {
+    sum(weatherData$rain[(weatherIndex - t*6):(weatherIndex - (t + 12)*6)])
+  })
+  
+  dayIntervals <- sapply(seq(24,96,24), function(t) {
+    sum(weatherData$rain[(weatherIndex - t*6):(weatherIndex - (t + 24)*6)])
+  })
+  
+  twoDayIntervals <- sapply(seq(48,96,48), function(t) {
+    sum(weatherData$rain[(weatherIndex - t*6):(weatherIndex - (t + 48)*6)])
+  })
+  
+  weekRain <- sum(weatherData$rain[(weatherIndex - 6*24*7):(weatherIndex)])
+  
+  c(halfDayIntervals, dayIntervals, twoDayIntervals, weekRain)
+})
+
+rainfallFeatures <- rainfallFeaturesSeparate %>% 
+  data.frame() %>% t() %>% data.frame()
+
+colnames(rainfallFeatures) = c(
+  "rain0_12", "rain12_24", "rain24_36", "rain36_48", "rain48_60", "rain60_72", "rain72_84", "rain84_96",
+  "rain0_24", "rain24_48", "rain48_72", "rain72_96",
+  "rain0_48", "rain48_96", "rainWeek")
+
+row.names(rainfallFeatures) = NULL
+
+```
+
+------------------------------------------------------------------------
+
+## 2.4 - Periodic Rain Features
+
+For each E. coli measure time, I run a loop:
+
+-   Using a day counter,
+-   While the time range is still valid, and the year is the same as the original measure time's year,
+-   I find the max rain value between the day counter and the original measure time.
+    -   If it is \> 0.1, this is a major rain event. Break.
+    -   Else if it is \> 0, this is a rain event. Continue looking for a major rain event.
+    -   Else, continue looking.
+
+**Since rain values aren't collected year-round, this metric might not be useful for E. coli observations during dry days at the beginning of the weather data collection period.**
+
+**This is not an issue in this scope, because weather data is collected starting on May 1st and E. coli data is collected starting at the end of June, and there has always been some rainfall between these two months.**
+
+**However, it could become an issue if E. coli data was collected closer to May 1st, before the first rainfall of the season.**
+
+```{r 2.3 - Periodic Rain Features}
+rainPeriodSeparate <- sapply(ecoliData$datetime, function(x) {
+  year <- format(
+    as.POSIXct(x, origin = "1970-01-01"),
+    format = "%Y")
+  
+  originalIndex = length(which(weatherData$datetime <= x))
+  
+  daysSinceLastRain <- 365
+  daysSinceLastMajorRain <- 365
+  day <- 0
+  
+  while (((originalIndex - day*6*24) > 1) 
+         & 
+         (format(as.POSIXct(weatherData$datetime[originalIndex]), "%Y") == year)) {
+    
+    maxRain <- max(weatherData$rain[(originalIndex - day*6*24):originalIndex])
+    
+    if (maxRain > 0.1) {
+      daysSinceLastMajorRain <- day
+      if (day < daysSinceLastRain) {
+        daysSinceLastRain <- day
+      }
+      break
+    } else if (maxRain > 0) {
+      if (day < daysSinceLastRain) {
+        daysSinceLastRain <- day
+      }
+    }
+    day <- day + 1
+  }#Close while loop
+  
+  c(daysSinceLastRain, daysSinceLastMajorRain)
+})
+
+rainPeriod <- rainPeriodSeparate %>%
+  data.frame() %>% t() %>% data.frame()
+
+colnames(rainPeriod) <- c("daysSinceLastRain", "daysSinceLastMajorRain")
+
+row.names(rainPeriod) <- NULL
+```
+
+------------------------------------------------------------------------
+
+## 2.5 - Other Weather Features
+
+This is similar to the code for [2.2 - Flow Features] except with more metrics in the sapply, that are concatenated together.
+
+```{r 2.4 - Other Weather Features}
+
+weatherFeaturesSeparate <- sapply(ecoliData$datetime, function(x) {
+  weatherIndex <- length(which(weatherData$datetime <= x))
+  
+  weatherTimes <- c(1, 12, 24, 28, 72) * 6
+  
+  weatherTempArray <- sapply(weatherTimes, function(x) {
+    c(
+      exp(mean(log(weatherData$pressure[(weatherIndex - x):weatherIndex]))), 
+      exp(mean(log(weatherData$par[(weatherIndex - x):weatherIndex]))),
+      exp(mean(log(weatherData$rh[(weatherIndex - x):weatherIndex]))),
+      exp(mean(log(weatherData$windSpeed[(weatherIndex - x):weatherIndex]))),
+      exp(mean(log(weatherData$gustSpeed[(weatherIndex - x):weatherIndex]))),
+      exp(mean(log(weatherData$dewPt[(weatherIndex - x):weatherIndex]))),
+      exp(mean(log(weatherData$airTemp[(weatherIndex - x):weatherIndex]))),
+      exp(mean(log(weatherData$waterTemp[(weatherIndex - x):weatherIndex])))
+    )
+  })
+  
+  c(t(weatherTempArray))
+})
+
+weatherFeatures <- weatherFeaturesSeparate %>%
+  data.frame() %>% t() %>% data.frame()
+
+colnames(weatherFeatures) <- c(
+  "hourAvgPressure", "halfDayAvgPressure", "dayAvgPressure", "twoDayAvgPressure", "threeDayAvgPressure",
+  "hourAvgPAR", "halfDayAvgPAR", "dayAvgPAR", "twoDayAvgPAR", "threeDayAvgPAR",
+  "hourAvgRH", "halfDayAvgRH", "dayAvgRH", "twoDayAvgRH", "threeDayAvgRH",
+  "hourAvgWind", "halfDayAvgWind", "dayAvgWind", "twoDayAvgWind", "threeDayAvgWind",
+  "hourAvgGust", "halfDayAvgGust", "dayAvgGust", "twoDayAvgGust", "threeDayAvgGust",
+  "hourAvgDew", "halfDayAvgDew", "dayAvgDew", "twoDayAvgDew", "threeDayAvgDew",
+  "hourAvgAirTemp", "halfDayAvgAirTemp", "dayAvgAirTemp", "twoDayAvgAirTemp", "threeDayAvgAirTemp",
+  "hourAvgWaterTemp", "halfDayAvgWaterTemp", "dayAvgWaterTemp", "twoDayAvgWaterTemp", "threeDayAvgWaterTemp")
+
+row.names(weatherFeatures) <- NULL
+```
+
+------------------------------------------------------------------------
+
+## 2.6 - Putting the Features Together
+
+Now, we `cbind` all four data frames together. For each of the 627 observations, we now have `datetime`, `year`, and 62 environmental features, to use in the prediction models.
+
+```{r 2.5 - cbind Features}
+
+features <- cbind(ecoliData$datetime, 
+                  (format(as.POSIXct(ecoliData$datetime), "%Y")),
+                  flowFeatures, rainfallFeatures, rainPeriod, weatherFeatures)
+
+names(features)[1] <- 'datetime'
+names(features)[2] <- 'year'
+
+dim(features)
+
+```
+
+------------------------------------------------------------------------
+
+## 2.7 - Checking Completeness of Features
+
+Before constructing the model, we should check the completeness of the Features data frame.
+
+### 2.7.1 - NAs
+
+First, we can use [the naniar package](https://cran.r-project.org/web/packages/naniar/vignettes/naniar-visualisation.html) to look at NA values. The `vis_miss` graphs (which I split into two plots so the labels are easier to read) show that most of the data has 0% missing, but the DewPt data and the WaterTemp data have gaps. The `geom_miss_point` graphs show that the DewPt data is periodically missing in 2018 and 2019, and the WaterTemp data is periodically missing in 2017, and unavailable in 2020 and 2021.
+
+```{r 2.6 - naniar, warning=FALSE}
+
+vis_miss(features[,1:32])
+vis_miss(features[,33:64])
+
+features %>% ggplot(aes(datetime, threeDayAvgDew)) +
+  geom_miss_point() +
+  ggtitle("Missing Dew Point data in 2018 and 2019")
+
+features %>% ggplot(aes(datetime, threeDayAvgWaterTemp)) +
+  geom_miss_point() +
+  ggtitle("Missing Water Temperature data is 2017 and 2020-2021")
+```
+
+Based on these results,
+
+-   We will not be using the DewPt data, since it is not particularly relevant to E. coli.
+-   We want to use the waterTemp data, since it is relevant to E. coli, so we will remove the rows for which `threeDayAvgWaterTemp` is null.
+
+```{r remove NAs}
+
+ecoliData <- ecoliData %>%
+  filter(!is.na(features$threeDayAvgWaterTemp))
+
+features <- features %>%
+  select(!c(hourAvgDew, halfDayAvgDew, dayAvgDew, twoDayAvgDew, threeDayAvgDew)) %>%
+  filter(!is.na(features$threeDayAvgWaterTemp))
+```
+
+### 2.7.2 - Flawed Values
+
+Just because the data exists doesn't mean that it is reliable. We should also check that the values are reasonable (no negative rainfalls, extreme temperatures, etc.) To do this, I created boxplots by year of every feature.
+
+```{r 2.6 - boxplots}
+
+completionBoxPlots <- lapply(names(features)[3:59], function(colName) {
+  ggplot(features, aes_string(x = "year", y = colName)) + 
+    geom_boxplot(outlier.color = "red", outlier.size = 3) +
+    coord_flip()
+})
+```
+
+I don't include all 62 graphs in this report, but I will include the anomalies below.
+
+First is the Wind and Gust data. From July to August of 2018, there are 39 rows where the wind values are around 217.2 mph, which is likely a device malfunction. Also, all of the data from 2019-2021 is 0.
+
+So, we will not consider wind speed or gust speed.
+
+```{r wind anomalies}
+
+completionBoxPlots[which(names(features) == "hourAvgWind") - 2]
+
+features %>% 
+  filter(year == 2018) %>%
+  ggplot(aes(datetime, hourAvgWind)) + 
+  geom_point() + 
+  ggtitle("Unreasonable Wind Data in 2018")
+
+features %>% 
+  filter(year == 2018) %>%
+  ggplot(aes(datetime, hourAvgGust)) + 
+  geom_point() + 
+  ggtitle("Unreasonable Gust Data in 2018")
+
+features$datetime[which(features$hourAvgWind == max(features$hourAvgWind))]
+
+features <- features %>%
+  select(!c(hourAvgWind, halfDayAvgWind, dayAvgWind, twoDayAvgWind, threeDayAvgWind,
+            hourAvgGust, halfDayAvgGust, dayAvgGust, twoDayAvgGust, threeDayAvgGust))
+```
+
+Second is the average air temperature, for which there are some low outliers in 2017 and 2018. This is expected, however, as October temperatures in Boston can be fairly cold. So, we will not remove any of this data.
+
+```{r temperature anomalies}
+completionBoxPlots[which(names(features) == "hourAvgAirTemp") - 2 + 10]
+
+features %>%
+  filter(year < 2019) %>%
+  ggplot(aes(datetime, hourAvgAirTemp)) +
+  geom_point() +
+  ggtitle("Water Temps decrease from Summer to Autumn, 2017 & 2018")
+
+features$datetime[which(features$hourAvgAirTemp < 45)]
+```
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+# Section 3: Constructing Models
+
+## 3.1 - GLM Model Setup
+
+To prepare our analysis, I separate our data by site number, and remove the datetime/year columns. We will be constructing and evaluating 4 different models, for our 4 different sites.
+
+The first model we will use is a GLM - a Generalized Linear Model, a type of logistic model. Instead of predicting the E. coli values, a GLM logistic model will make a binomial prediction - whether the E. Coli data is safe (below 630) or unsafe (above 630). So, we will cast this vector of numeric values to a vector of 0 (safe) or 1 (unsafe).
+
+In my variable names, x refers to the predictors (weather, flow discharge) and y refers to the 0/1 E. coli safety levels.
+
+```{r 3.1 - split by location}
+
+indicesLoc1 <- which(ecoliData$Site_ID == "1NBS")
+indicesLoc2 <- which(ecoliData$Site_ID == "2LARZ")
+indicesLoc3 <- which(ecoliData$Site_ID == "3BU")
+indicesLoc4 <- which(ecoliData$Site_ID == "4LONG")
+
+xLoc1 <- features[indicesLoc1,-(1:2)]
+xLoc2 <- features[indicesLoc2,-(1:2)]
+xLoc3 <- features[indicesLoc3,-(1:2)]
+xLoc4 <- features[indicesLoc4,-(1:2)]
+
+safetyThreshold <- 630
+ecoliData <- ecoliData %>%
+  mutate(safety = ifelse(Reporting_Result < safetyThreshold, 0, 1))
+
+yLoc1 <- ecoliData$safety[indicesLoc1]
+yLoc2 <- ecoliData$safety[indicesLoc2]
+yLoc3 <- ecoliData$safety[indicesLoc3]
+yLoc4 <- ecoliData$safety[indicesLoc4]
+
+dataLoc1 <- cbind(yLoc1, xLoc1)
+dataLoc2 <- cbind(yLoc2, xLoc2)
+dataLoc3 <- cbind(yLoc3, xLoc3)
+dataLoc4 <- cbind(yLoc4, xLoc4)
+```
+
+In the below code, I randomly split the data into two partitions: a training set and a testing set. We will train the model on the former data, and test the model on the latter to evaluate its accuracy. This is to prevent **overtraining**, where our model is trained to work very well on the measured data, so the accuracy value we generate from this dataset may be unfairly high compared to data outside our sample.
+
+Because the unsafe-ecoli data is sparse, I want to ensure that both the training and testing partitions have enough unsafe-ecoli data. So, I split these rows 50-50. (`rainWeek` is arbitrarily chosen in the code because the function `createDataPartition` acts on vectors, not data frames - `yLoc` cannot be used since it's homogeneous in those split safe/unsafe partitions.) The rest of the data is split 80-20, as is standard.
+
+```{r 3.1 - hybrid safe/unsafe partition}
+
+#Break the data into Unsafe and Safe
+
+dataLoc1Unsafe <- dataLoc1 %>% filter(yLoc1 == 1)
+dataLoc1Safe <- dataLoc1 %>% filter(yLoc1 == 0)
+dataLoc2Unsafe <- dataLoc2 %>% filter(yLoc2 == 1)
+dataLoc2Safe <- dataLoc2 %>% filter(yLoc2 == 0)
+dataLoc3Unsafe <- dataLoc3 %>% filter(yLoc3 == 1)
+dataLoc3Safe <- dataLoc3 %>% filter(yLoc3 == 0)
+dataLoc4Unsafe <- dataLoc4 %>% filter(yLoc4 == 1)
+dataLoc4Safe <- dataLoc4 %>% filter(yLoc4 == 0)
+
+#Create data partitions
+
+trainingIndicesLoc1Unsafe <- createDataPartition(dataLoc1Unsafe$rainWeek, times = 1, p = 0.5, list = FALSE)
+trainingIndicesLoc1Safe <- createDataPartition(dataLoc1Safe$rainWeek, times = 1, p = 0.8, list = FALSE)
+
+trainingIndicesLoc2Unsafe <- createDataPartition(dataLoc2Unsafe$rainWeek, times = 1, p = 0.5, list = FALSE)
+trainingIndicesLoc2Safe <- createDataPartition(dataLoc2Safe$rainWeek, times = 1, p = 0.8, list = FALSE)
+
+trainingIndicesLoc3Unsafe <- createDataPartition(dataLoc3Unsafe$rainWeek, times = 1, p = 0.5, list = FALSE)
+trainingIndicesLoc3Safe <- createDataPartition(dataLoc3Safe$rainWeek, times = 1, p = 0.8, list = FALSE)
+
+trainingIndicesLoc4Unsafe <- createDataPartition(dataLoc4Unsafe$rainWeek, times = 1, p = 0.5, list = FALSE)
+trainingIndicesLoc4Safe <- createDataPartition(dataLoc4Safe$rainWeek, times = 1, p = 0.8, list = FALSE)
+
+#rbind the data back together, using these partition indices
+
+trainLoc1 <- rbind(dataLoc1Unsafe[trainingIndicesLoc1Unsafe,],
+                   dataLoc1Safe[trainingIndicesLoc1Safe,])
+testLoc1 <- rbind(dataLoc1Unsafe[-trainingIndicesLoc1Unsafe,],
+                   dataLoc1Safe[-trainingIndicesLoc1Safe,])
+
+trainLoc2 <- rbind(dataLoc2Unsafe[trainingIndicesLoc2Unsafe,],
+                   dataLoc2Safe[trainingIndicesLoc2Safe,])
+testLoc2 <- rbind(dataLoc2Unsafe[-trainingIndicesLoc2Unsafe,],
+                   dataLoc2Safe[-trainingIndicesLoc2Safe,])
+
+trainLoc3 <- rbind(dataLoc3Unsafe[trainingIndicesLoc3Unsafe,],
+                   dataLoc3Safe[trainingIndicesLoc3Safe,])
+testLoc3 <- rbind(dataLoc3Unsafe[-trainingIndicesLoc3Unsafe,],
+                   dataLoc3Safe[-trainingIndicesLoc3Safe,])
+
+trainLoc4 <- rbind(dataLoc4Unsafe[trainingIndicesLoc4Unsafe,],
+                   dataLoc4Safe[trainingIndicesLoc4Safe,])
+testLoc4 <- rbind(dataLoc4Unsafe[-trainingIndicesLoc4Unsafe,],
+                   dataLoc4Safe[-trainingIndicesLoc4Safe,])
+
+```
+
+------------------------------------------------------------------------
+
+## 3.2 - Logistic Regression: binomial GLM
+
+In this section, I use the Generalized Linear Model algorithm to create logit models on the training data.
+
+For each location, I first use all available features, and calculate the AIC (Akaike Information Criterion). Then, I construct the ANOVA (Analysis of Variables) table, and choose the most significant variables to minimize the AIC.
+
+Once I have the best model, I use the `caret::predict()` function, still on the training data, using type = "response" to get probabilities between 0 and 1. Without this parameter, the output is log odds. Using a selection of thresholds to convert this to either 0 or 1, I compare this to the actual observed E. coli using a Confusion Matrix, from which we can determine the TPR, FPR, TNR, and FNR. The value that we care about the most is "missed hits" - when the model predicts that the E. coli level is safe, but we observed that it was unsafe.
+
+After choosing the best threshold using the training data, I then apply the best model with the best threshold to the Testing data, and create a final Confusion Matrix.
+
+### 3.2.1 - Location 1 GLM
+
+Using all variables, the AIC is 94. The ANOVA variables can vary by the random partitions, but the best variables at the time of my analysis are `dayAvgFlow`, `twoDayAvgPressure`, `halfDayAvgFlow`, `rain0_12`, and `daysSinceLastRain`.
+
+A four-variable model (excluding `halfDayAvgFlow` since it's likely highly correlated with `dayAvgFlow`) yields an AIC of 35.9. A three-variable model (also excluding `twoDayAvgPressure` since pressure is known to be correlated with rain) yields an AIC of 36.5. I tested other combinations as well, but the four-variable model appears to be the best.
+
+```{r Location 1 GLM, warning=FALSE}
+
+glmLoc1 <- glm(yLoc1 ~ ., family = binomial, data = trainLoc1)
+glmLoc1$aic
+
+anovaLoc1 <- anova(glmLoc1, test = "Chisq")
+anovaLoc1 %>% slice_min(`Pr(>Chi)`, n = 10)
+
+fourVarGlmLoc1 <- glm(yLoc1 ~ dayAvgFlow + twoDayAvgPressure + rain0_12 + daysSinceLastRain,
+                     family = binomial,
+                     data = trainLoc1)
+fourVarGlmLoc1$aic
+
+threeVarGlmLoc1 <- glm(yLoc1 ~ dayAvgFlow + rain0_12 + daysSinceLastRain,
+                     family = binomial,
+                     data = trainLoc1)
+threeVarGlmLoc1$aic
+
+```
+
+Using `sapply` to check various thresholds, I decided on 0.5 for this location.
+
+```{r Predict GLM Location 1, warning=FALSE}
+
+trainPredictGlmLoc1 <- predict(fourVarGlmLoc1, trainLoc1, type = "response")
+thresholdChoicesLoc1 <- sapply(seq(0.5, 0.65, 0.01), function(x) {
+  confusionMatrix(
+    as.factor(ifelse(trainPredictGlmLoc1 > x, 1, 0)), 
+    as.factor(trainLoc1$yLoc1))$table
+  })
+thresholdChoicesLoc1
+
+thresholdLoc1 <- 0.5
+
+testPredictGlmLoc1 <- predict(fourVarGlmLoc1, testLoc1, type = "response")
+cmGlmLoc1 <- confusionMatrix(
+  as.factor(ifelse(testPredictGlmLoc1 > thresholdLoc1, 1, 0)), 
+  as.factor(testLoc1$yLoc1))
+cmGlmLoc1$table
+
+```
+
+Among the testing data, the accuracy is 81%, and the missed-hit rate is 42%.
+
+### 3.2.2 - Location 2 GLM
+
+Using all variables, the AIC is 96. At the time of my analysis, the best variables are `daysSinceLastMajorRain`, `hourAvgPressure`, several different Flow features, and `rain0_12`.
+
+A four-variable model (using `dayAvgFlow` and the 3 specified variables above), a two-variable model using only Pressure and Rain, and a one-variable model using only Rain, all yield an AIC of 43.
+
+```{r Location 2 GLM, warning=FALSE}
+
+glmLoc2 <- glm(yLoc2 ~ ., family = binomial, data = trainLoc2)
+glmLoc2$aic
+
+anovaLoc2 <- anova(glmLoc2, test = "Chisq")
+anovaLoc2 %>% slice_min(`Pr(>Chi)`, n = 10)
+
+fourVarGlmLoc2 <- glm(yLoc2 ~ daysSinceLastMajorRain + hourAvgPressure + dayAvgFlow + rain0_12,
+                      family = binomial,
+                      data = trainLoc2)
+fourVarGlmLoc2$aic
+
+twoVarGlmLoc2 <- glm(yLoc2 ~  hourAvgPressure + rain0_12,
+                      family = binomial,
+                      data = trainLoc2)
+twoVarGlmLoc2$aic
+
+oneVarGlmLoc2 <- glm(yLoc2 ~ rain0_12,
+                     family = binomial,
+                     data = trainLoc2)
+oneVarGlmLoc2$aic
+```
+
+I decided to test all three of these models. For all of them, 0.6 was an acceptable criteria based on the training data.
+
+```{r Predict GLM Location 2, warning=FALSE}
+
+fourVarTrainPredictGlmLoc2 <- predict(fourVarGlmLoc2, trainLoc2, type = "response")
+fourVarThresholdChoicesLoc2 <- sapply(seq(0.5, 0.65, 0.01), function(x) {
+  confusionMatrix(
+    as.factor(ifelse(fourVarTrainPredictGlmLoc2 > x, 1, 0)),
+    as.factor(trainLoc2$yLoc2))$table
+  })
+fourVarThresholdChoicesLoc2
+
+twoVarTrainPredictGlmLoc2 <- predict(twoVarGlmLoc2, trainLoc2, type = "response")
+twoVarThresholdChoicesLoc2 <- sapply(seq(0.5, 0.65, 0.01), function(x) {
+  confusionMatrix(
+    as.factor(ifelse(twoVarTrainPredictGlmLoc2 > x, 1, 0)),
+    as.factor(trainLoc2$yLoc2))$table
+  })
+twoVarThresholdChoicesLoc2
+
+oneVarTrainPredictGlmLoc2 <- predict(oneVarGlmLoc2, trainLoc2, type = "response")
+oneVarThresholdChoicesLoc2 <- sapply(seq(0.5, 0.65, 0.01), function(x) {
+  confusionMatrix(
+    as.factor(ifelse(oneVarTrainPredictGlmLoc2 > x, 1, 0)),
+    as.factor(trainLoc2$yLoc2))$table
+  })
+oneVarThresholdChoicesLoc2
+
+thresholdLoc2 <- 0.6
+
+fourVarTestPredictGlmLoc2 <- predict(fourVarGlmLoc2, testLoc2, type = "response")
+fourVarCmGlmLoc2 <- confusionMatrix(
+  as.factor(ifelse(fourVarTestPredictGlmLoc2 > thresholdLoc2, 1, 0)),
+  as.factor(testLoc2$yLoc2))
+fourVarCmGlmLoc2$table
+
+twoVarTestPredictGlmLoc2 <- predict(twoVarGlmLoc2, testLoc2, type = "response")
+twoVarCmGlmLoc2 <- confusionMatrix(
+  as.factor(ifelse(twoVarTestPredictGlmLoc2 > thresholdLoc2, 1, 0)),
+  as.factor(testLoc2$yLoc2))
+twoVarCmGlmLoc2$table
+
+oneVarTestPredictGlmLoc2 <- predict(oneVarGlmLoc2, testLoc2, type = "response")
+oneVarCmGlmLoc2 <- confusionMatrix(
+  as.factor(ifelse(oneVarTestPredictGlmLoc2 > thresholdLoc2, 1, 0)),
+  as.factor(testLoc2$yLoc2))
+oneVarCmGlmLoc2$table
+```
+
+All three models behaved in the same way with regards to the testing data. The accuracy is 81%, and the ***missed-hit rate is 71%.***
+
+### 3.2.3 - Location 3 GLM
+
+Using all variables, the AIC is 94. At the time of my analysis, the best variables are `daysSinceLastMajorRain`, `dayAvgFlow`, `halfDayAvgFlow`, `hourAvgFlow`, and `rain24_36` .
+
+A three-variable model (only using `dayAvgFlow` among the three flow features) yields an AIC of 57.9. Other models yield similar AICs, but to preserve the accuracy I will use this three-variable model.
+
+```{r Location 3 GLM, warning=FALSE}
+glmLoc3 <- glm(yLoc3 ~ ., family = binomial, data = trainLoc3)
+glmLoc3$aic
+
+anovaLoc3 <- anova(glmLoc3, test = "Chisq")
+anovaLoc3 %>% slice_min(`Pr(>Chi)`, n = 10)
+
+threeVarGlmLoc3 <- glm(yLoc3 ~ daysSinceLastMajorRain + dayAvgFlow + rain24_36,
+                       family = binomial,
+                       data = trainLoc3)
+threeVarGlmLoc3$aic
+```
+
+When checking various thresholds, I noticed that only one sample was identified as unsafe.
+
+```{r predict GLM Location 3, warning=FALSE}
+
+trainPredictGlmLoc3 <- predict(threeVarGlmLoc3, trainLoc3, type = "response")
+thresholdChoicesLoc3 <- sapply(seq(0.5, 0.65, 0.01), function(x) {
+  confusionMatrix(
+    as.factor(ifelse(trainPredictGlmLoc3 > x, 1, 0)),
+    as.factor(trainLoc3$yLoc3))$table
+  })
+thresholdChoicesLoc3
+```
+
+Setting a threshold of 0.5, the three-variable model **never identified an unsafe sample in the test data.**
+
+Even when using all 47 variables, **the missed-hit rate is 63%.**
+
+```{r predict CM GLM Location 3, warning = FALSE}
+
+thresholdLoc3 <- 0.5
+testPredictGlmLoc3 <- predict(threeVarGlmLoc3, testLoc3, type = "response")
+cmGlmLoc3 <- confusionMatrix(
+  as.factor(ifelse(testPredictGlmLoc3 > thresholdLoc3, 1, 0)), 
+  as.factor(testLoc3$yLoc3))
+cmGlmLoc3$table
+
+predictFull <- predict(glmLoc3, testLoc3, type = "response")
+fullCmGlmLoc3 <- confusionMatrix(
+  as.factor(ifelse(predictFull > thresholdLoc3, 1, 0)), 
+  as.factor(testLoc3$yLoc3))
+fullCmGlmLoc3$table
+
+```
+
+### 3.2.4 - Location 4 GLM
+
+**Preface - I would not expect a GLM to be accurate for Location 4. Out of 125 observations, only 3 had dangerous levels of E. coli. 2 are in the training set, and 1 is in the test set.**
+
+Using all variables, the AIC is 96. The only reliable variables are the Flow variables.
+
+A four-variable model using only Flow variables yields a better AIC of 10. A one-variable model, using the best of these (`twoDayAvgFlow`) yields an AIC of 23.3.
+
+```{r Location 4 GLM, warning=FALSE}
+
+glmLoc4 <- glm(yLoc4 ~ ., family = binomial, data = trainLoc4)
+glmLoc4$aic
+
+anovaLoc4 <- anova(glmLoc4, test = "Chisq")
+anovaLoc4 %>% slice_min(`Pr(>Chi)`, n = 10)
+
+
+
+fourVarGlmLoc4 <- glm(yLoc4 ~ hourAvgFlow + halfDayAvgFlow + dayAvgFlow + twoDayAvgFlow,
+                       family = binomial,
+                       data = trainLoc4)
+fourVarGlmLoc4$aic
+
+oneVarGlmLoc4 <- glm(yLoc4 ~ twoDayAvgFlow,
+                     family = binomial,
+                     data = trainLoc4)
+oneVarGlmLoc4$aic
+```
+
+Using `sapply` to check various thresholds, a threshold of 0.5 is appropriate. The model is able to flag these two hits.
+
+```{r Predict GLM Location 4, warning=FALSE}
+
+trainPredictGlmLoc4 <- predict(fourVarGlmLoc4, trainLoc4, type = "response")
+thresholdChoicesLoc4 <- sapply(seq(0.5, 0.65, 0.01), function(x) {
+  confusionMatrix(
+    as.factor(ifelse(trainPredictGlmLoc4 > x, 1, 0)), 
+    as.factor(trainLoc4$yLoc4))$table
+  })
+thresholdChoicesLoc4
+
+thresholdLoc4 <- 0.5
+
+testPredictGlmLoc4 <- predict(fourVarGlmLoc4, testLoc4, type = "response")
+cmGlmLoc4 <- confusionMatrix(
+  as.factor(ifelse(testPredictGlmLoc4 > thresholdLoc4, 1, 0)), 
+  as.factor(testLoc4$yLoc4))
+cmGlmLoc4$table
+
+```
+
+In the testing data, however, the model is unable to flag the one hit.
+
+------------------------------------------------------------------------
+
+## 3.3 - MLR Model Setup
+
+After the results of the GLM Regression Models, I wanted to see if I could create a better model using MLR Regression. In this type of model, I take the `log()` of the original observations, calculate a normal linear regression using `lm()`, and convert to 0/1 afterwards to calculate the Confusion Matrix.
+
+First, however, I'll need to redefine the y parts of the model.
+
+```{r 3.3 - MLR setup}
+
+yLoc1 <- log(ecoliData$Reporting_Result[indicesLoc1])
+yLoc2 <- log(ecoliData$Reporting_Result[indicesLoc2])
+yLoc3 <- log(ecoliData$Reporting_Result[indicesLoc3])
+yLoc4 <- log(ecoliData$Reporting_Result[indicesLoc4])
+
+dataLoc1 <- cbind(yLoc1, xLoc1)
+dataLoc2 <- cbind(yLoc2, xLoc2)
+dataLoc3 <- cbind(yLoc3, xLoc3)
+dataLoc4 <- cbind(yLoc4, xLoc4)
+```
+
+I still want to ensure that enough high E. coli river conditions are in both the training and the testing data. So, for each location, I partition the data 50-50 for the top 25% concentrations, and 80-20 for the rest.
+
+```{r 3.3 - MLR quantile division}
+
+dataLoc1Unsafe <- dataLoc1 %>% filter(yLoc1 >= quantile(yLoc1)[4])
+dataLoc1Safe <- dataLoc1 %>% filter(yLoc1 < quantile(yLoc1)[4])
+dataLoc2Unsafe <- dataLoc2 %>% filter(yLoc2 >= quantile(yLoc2)[4])
+dataLoc2Safe <- dataLoc2 %>% filter(yLoc2 < quantile(yLoc2)[4])
+dataLoc3Unsafe <- dataLoc3 %>% filter(yLoc3 >= quantile(yLoc3)[4])
+dataLoc3Safe <- dataLoc3 %>% filter(yLoc3 < quantile(yLoc3)[4])
+dataLoc4Unsafe <- dataLoc4 %>% filter(yLoc4 >= quantile(yLoc4)[4])
+dataLoc4Safe <- dataLoc4 %>% filter(yLoc4 < quantile(yLoc4)[4])
+```
+
+The rest of the code is the same as before.
+
+```{r 3.3 - MLR hybrid partition}
+
+#Create data partitions
+
+trainingIndicesLoc1Unsafe <- createDataPartition(dataLoc1Unsafe$rainWeek, times = 1, p = 0.5, list = FALSE)
+trainingIndicesLoc1Safe <- createDataPartition(dataLoc1Safe$rainWeek, times = 1, p = 0.8, list = FALSE)
+
+trainingIndicesLoc2Unsafe <- createDataPartition(dataLoc2Unsafe$rainWeek, times = 1, p = 0.5, list = FALSE)
+trainingIndicesLoc2Safe <- createDataPartition(dataLoc2Safe$rainWeek, times = 1, p = 0.8, list = FALSE)
+
+trainingIndicesLoc3Unsafe <- createDataPartition(dataLoc3Unsafe$rainWeek, times = 1, p = 0.5, list = FALSE)
+trainingIndicesLoc3Safe <- createDataPartition(dataLoc3Safe$rainWeek, times = 1, p = 0.8, list = FALSE)
+
+trainingIndicesLoc4Unsafe <- createDataPartition(dataLoc4Unsafe$rainWeek, times = 1, p = 0.5, list = FALSE)
+trainingIndicesLoc4Safe <- createDataPartition(dataLoc4Safe$rainWeek, times = 1, p = 0.8, list = FALSE)
+
+#rbind the data back together, using these partition indices
+
+trainLoc1 <- rbind(dataLoc1Unsafe[trainingIndicesLoc1Unsafe,],
+                   dataLoc1Safe[trainingIndicesLoc1Safe,])
+testLoc1 <- rbind(dataLoc1Unsafe[-trainingIndicesLoc1Unsafe,],
+                   dataLoc1Safe[-trainingIndicesLoc1Safe,])
+
+trainLoc2 <- rbind(dataLoc2Unsafe[trainingIndicesLoc2Unsafe,],
+                   dataLoc2Safe[trainingIndicesLoc2Safe,])
+testLoc2 <- rbind(dataLoc2Unsafe[-trainingIndicesLoc2Unsafe,],
+                   dataLoc2Safe[-trainingIndicesLoc2Safe,])
+
+trainLoc3 <- rbind(dataLoc3Unsafe[trainingIndicesLoc3Unsafe,],
+                   dataLoc3Safe[trainingIndicesLoc3Safe,])
+testLoc3 <- rbind(dataLoc3Unsafe[-trainingIndicesLoc3Unsafe,],
+                   dataLoc3Safe[-trainingIndicesLoc3Safe,])
+
+trainLoc4 <- rbind(dataLoc4Unsafe[trainingIndicesLoc4Unsafe,],
+                   dataLoc4Safe[trainingIndicesLoc4Safe,])
+testLoc4 <- rbind(dataLoc4Unsafe[-trainingIndicesLoc4Unsafe,],
+                   dataLoc4Safe[-trainingIndicesLoc4Safe,])
+```
+
+## 3.4 - Multivariate Regression: logarithmic MLR
+
+Our goal with the MLR model is to predict when the E. coli concentration is above 1260 CFU/100mL. This is the statistical threshold value above which we deem the water unsafe.
+
+In order to create a conservative and safe model, I will implement a threshold of 235 CFU/100mL (the single sample limit for freshwater primary contact recreation, designated swimming area) in the creation of my MLR models. These thresholds will determine how we convert the predictions to a binary safe/unsafe.
+
+For each location, I calculated the R-squared value for the model using all variables, and then use `varImp()` to select a reasonable subset of those variables. Then, I use the above thresholds to construct a Confusion Matrix. Again, we care most about minimizing the missed-hits rate.
+
+### 3.4.1 - Location 1 MLR
+
+Using all variables, the model has an R-squared of 0.5057.
+
+A two-variable model using `rain0_12` and `hourAvgFlow` has an adjusted R-squared of 0.3105.
+
+```{r train MLR Location 1, warning = FALSE}
+
+mlrLoc1 <- train(yLoc1 ~ ., data = trainLoc1, method = "lm")
+varImp(mlrLoc1)
+
+twoVarMlrLoc1 <- train(yLoc1 ~ rain0_12 + hourAvgFlow,
+                    data = trainLoc1,
+                    method = "lm")
+summary(twoVarMlrLoc1)
+```
+
+I test this model on the testing data, and calculate a Confusion Matrix using the thresholds from above.
+
+The accuracy level is 88%, and there were 0% missed hits.
+
+```{r test MLR Location 1, warning=FALSE}
+
+testTwoVarMlrLoc1 <- 5.1681832 + (4.6625787 * testLoc1$rain0_12) + (0.0006113 * testLoc1$hourAvgFlow)
+
+cmMlrLoc1 <- confusionMatrix(
+  as.factor(ifelse(testTwoVarMlrLoc1 > log(235), 1, 0)),
+  as.factor(ifelse(testLoc1$yLoc1 > log(1260), 1, 0))
+)
+
+cmMlrLoc1$table
+```
+
+### 3.4.2 - Location 2 MLR
+
+Using all variables, the model has an R-squared of 0.4469.
+
+A three-variable model using `rain0_12`, `threeDayAvgAirTemp`, and `daysSinceLastMajorRain` has an adjusted R-squared of 0.1619.
+
+```{r train MLR Location 2, warning=FALSE}
+
+mlrLoc2 <- train(yLoc2 ~ ., data = trainLoc2, method = "lm")
+varImp(mlrLoc2)
+
+threeVarMlrLoc2 <- train(yLoc2 ~ rain0_12 + threeDayAvgAirTemp + daysSinceLastMajorRain,
+                         data = trainLoc2,
+                         method = "lm")
+summary(threeVarMlrLoc2)
+```
+
+On the testing data, the accuracy level is 94%, and there were 33% missed hits.
+
+```{r test MLR Location 2, warning=FALSE}
+
+testThreeVarMlrLoc2 <- 5.501886 + (2.997021 * testLoc2$rain0_12) + (-0.014088 * testLoc2$threeDayAvgAirTemp) + (0.003538 * testLoc2$daysSinceLastMajorRain)
+
+cmMlrLoc2 <- confusionMatrix(
+  as.factor(ifelse(testThreeVarMlrLoc2 > log(235), 1, 0)),
+  as.factor(ifelse(testLoc2$yLoc2 > log(1260), 1, 0))
+)
+cmMlrLoc2$table
+```
+
+### 3.4.3 - Location 3 MLR
+
+Using all variables, the model has an R-squared of 0.3712.
+
+A three-variable model using `halfDayAvgFlow`, `dayAvgFlow`, and `rain0_12` has an adjusted R-squared of 0.3952.
+
+```{r train MLR Location 3, warning=FALSE}
+
+mlrLoc3 <- train(yLoc3 ~ ., data = trainLoc3, method = "lm")
+varImp(mlrLoc3)
+
+threeVarMlrLoc3 <- train(yLoc3 ~ halfDayAvgFlow + dayAvgFlow + rain0_12,
+                      data = trainLoc3,
+                      method = "lm")
+summary(threeVarMlrLoc3)
+```
+
+For this Confusion Matrix, the accuracy level is 88% and there were 50% missed hits.
+
+```{r test MLR Location 3, warning=FALSE}
+
+testThreeVarMlrLoc3 <- 4.380013 + (0.011368 * testLoc3$halfDayAvgFlow) + (-0.010225 * testLoc3$dayAvgFlow) + (3.765905 * testLoc3$rain0_12)
+
+cmMlrLoc3 <- confusionMatrix(
+  as.factor(ifelse(testThreeVarMlrLoc3 > log(235), 1, 0)),
+  as.factor(ifelse(testLoc3$yLoc3 > log(1260), 1, 0))
+)
+cmMlrLoc3$table
+```
+
+### 3.4.4 - Location 4 MLR
+
+Using all variables, the model has an R-squared of 0.3822.
+
+A four-variable model using `rain48_96`, `hourAvgFlow`, `rainWeek`, and `rain0_12` has an adjusted R-squared of 0.1606.
+
+```{r train MLR Location 4, warning=FALSE}
+mlrLoc4 <- train(yLoc4 ~ ., data = trainLoc4, method = "lm")
+varImp(mlrLoc4)
+
+fourVarMlrLoc4 <- train(yLoc4 ~ rain48_96 + hourAvgFlow + rainWeek + rain0_12,
+                        data = trainLoc4,
+                        method = "lm")
+summary(fourVarMlrLoc4)
+```
+
+For this Confusion Matrix, the accuracy level is 97% and there were 0% missed hits (out of 1 unsafe observation, the model caught it.)
+
+```{r test MLR Location 4, warning=FALSE}
+
+testFourVarMlrLoc4 <- 3.0615415 + (-0.5564694 * testLoc4$rain48_96) + (0.0022405 * testLoc4$hourAvgFlow) + (0.2938575 * testLoc4$rainWeek) + (-0.0305788 * testLoc4$rain0_12)
+
+cmMlrLoc4 <- confusionMatrix(
+  as.factor(ifelse(testFourVarMlrLoc4 > log(235), 1, 0)),
+  as.factor(ifelse(testLoc4$yLoc4 > log(1260), 1, 0))
+)
+cmMlrLoc4$table
+```
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+# Section 4: Conclusion
+
+## 4.1 - Final Models
+
+After comparing the results of the logistic Generalized Linear Model, a normal Multivariate Linear Regression (not included in this document), and a log-transformed Multivariate Linear Regression, I conclude that the log-transformed Multivariate Linear Regression is the best option for this flagging model.
+
+For each location, we predict the natural log of the E. coli population as a linear combination of various weather and river discharge factors, summarized below. If the output is greater than `log(235)`, then this model predicts that the water should be flagged.
+
+It should also be noted that this model is only a prediction, and that it is derived from a rather small sample size. One of the main reasons why modeling whether the E. coli population is unsafe is difficult, is that the river is so often safe. For example, at CRWA's Location 4, over the 6 years from 2017 to 2022, an E. coli population above 1260 was only recorded once. The arithmetic mean at Location 4 is 94.7.
+
+Without further ado, here are the final models:
+
+**For Location 1:**
+
+$log(y_1) \approx 5.1681832 + 4.6625787 * (A) + 0.0006113 * (B)$
+
+-   A is the total rain in inches over the last 0-12 hours.
+
+-   B is the average flow discharge over the last 0-1 hour.
+
+If $log(y_1) > log(235)$, the water should be flagged.
+
+Here is the Confusion Matrix on the testing data, as well as across both the training and testing data.
+
+```{r Final CMs Loc 1}
+cmMlrLoc1$table
+
+entireTwoVarMlrLoc1 <- 5.1681832 + (4.6625787 * dataLoc1$rain0_12) + (0.0006113 * dataLoc1$hourAvgFlow)
+
+confusionMatrix(
+  as.factor(ifelse(entireTwoVarMlrLoc1 > log(235), 1, 0)),
+  as.factor(ifelse(dataLoc1$yLoc1 > log(1260), 1, 0))
+)$table
+```
+
+**For Location 2:**
+
+$log(y_2) \approx 5.501886 + 2.997021 * (A) - 0.014088 * (B) + 0.003538 * (C)$
+
+-   A is the total rain in inches over the last 0-12 hours.
+
+-   B is the average air temperature over the last 0-3 days.
+
+-   C is the number of days since the last "Major Rainfall" (more than 0.1 inches)
+
+If $log(y_2) > log(235)$, the water should be flagged.
+
+Here are the two Confusion Matrices.
+
+```{r Final CMs Loc 2}
+cmMlrLoc2$table
+
+entireThreeVarMlrLoc2 <- 5.501886 + (2.997021 * dataLoc2$rain0_12) + (-0.014088 * dataLoc2$threeDayAvgAirTemp) + (0.003538 * dataLoc2$daysSinceLastMajorRain)
+
+confusionMatrix(
+  as.factor(ifelse(entireThreeVarMlrLoc2 > log(235), 1, 0)),
+  as.factor(ifelse(dataLoc2$yLoc2 > log(1260), 1, 0))
+)$table
+```
+
+**For Location 3:**
+
+$log(y_3) \approx 4.380013 + 0.011368 * (A) -0.010225 * (B) + 3.765905 * (C)$
+
+-   A is the average flow discharge over the last 0-12 hours.
+
+-   B is the average flow discharge over the last 0-24 hours.
+
+-   C is the total rain in inches over the last 0-12 hours.
+
+If $log(y_3) > log(235)$, the water should be flagged.
+
+Here are the two Confusion Matrices.
+
+```{r Final CMs Loc 3}
+cmMlrLoc3$table
+
+entireThreeVarMlrLoc3 <- 4.380013 + (0.011368 * dataLoc3$halfDayAvgFlow) + (-0.010225 * dataLoc3$dayAvgFlow) + (3.765905 * dataLoc3$rain0_12)
+
+confusionMatrix(
+  as.factor(ifelse(entireThreeVarMlrLoc3 > log(235), 1, 0)),
+  as.factor(ifelse(dataLoc3$yLoc3 > log(1260), 1, 0))
+)$table
+```
+
+**For Location 4:**
+
+$log(y_4) \approx 3.0615415 -0.5564694 * (A) + 0.0022405 * (B) + 0.2938575 * (C) -0.0305788 * (D)$
+
+-   A is the total rain in inches over the last 48-96 hours.
+
+-   B is the average flow discharge over the last 0-1 hour.
+
+-   C is the total rain in inches over the last 0-7 days.
+
+-   D is the total rain in inches over the last 0-12 hours.
+
+If $log(y_4) > log(235)$, the water should be flagged.
+
+Here are the two Confusion Matrices.
+
+```{r Final CMs Loc 4}
+cmMlrLoc4$table
+
+entireFourVarMlrLoc4 <- 3.0615415 + (-0.5564694 * dataLoc4$rain48_96) + (0.0022405 * dataLoc4$hourAvgFlow) + (0.2938575 * dataLoc4$rainWeek) + (-0.0305788 * dataLoc4$rain0_12)
+
+confusionMatrix(
+  as.factor(ifelse(entireFourVarMlrLoc4 > log(235), 1, 0)),
+  as.factor(ifelse(dataLoc4$yLoc4 > log(1260), 1, 0))
+)$table
+```
+
+## 4.2 - Closing Remarks
+
+Thank you for reading this report! I hope you found this documentation informational and useful.
+
+Thank you to the Charles River Watershed Association, especially Lisa Kumpf and Max Rome, for the opportunity to work on these models and for their support during my internship. Thank you as well to Eli Kane, a past intern whose documentation from several years ago served as a starting point for my data exploration.
+
+------------------------------------------------------------------------
+
+Ayushman Choudhury \| Brown University Class of 2025 \| January 20, 2023
